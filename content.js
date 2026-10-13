@@ -1,106 +1,142 @@
-﻿console.log('[Mercari Warning] Script loading...');
-
 (function() {
-  console.log('[Mercari Warning] Extension started!');
-  console.log('[Mercari Warning] Current URL:', window.location.href);
+  const DEBUG = false;
+  const log = (...args) => { if (DEBUG) console.log('[Mercari Warning]', ...args); };
 
   const warningTitle = chrome.i18n.getMessage('warningTitle') || 'Pay on Delivery';
   const warningMessage = chrome.i18n.getMessage('warningMessage') || 'This item is cash on delivery.';
   const closeWarningAriaLabel = chrome.i18n.getMessage('closeWarningAriaLabel') || 'Close warning';
-  
-  if (!window.location.pathname.includes('/item/')) {
-    console.log('[Mercari Warning] Not on item page, pathname:', window.location.pathname);
-    return;
+
+  const WARNING_ID = 'mercari-warning-box';
+
+  // Labels for the "who pays shipping" row on the item page.
+  const SHIPPING_LABELS = ['配送料の負担', 'Shipping cost'];
+
+  // Values that mean the buyer pays on delivery.
+  const PAY_ON_DELIVERY_TERMS = [
+    '着払い',
+    '代引き',
+    '代金引換',
+    'paid on delivery',
+    'payment on delivery',
+    'pay on delivery',
+    'cash on delivery'
+  ];
+
+  // Keep re-checking this long after a navigation, since Mercari renders
+  // the item details asynchronously.
+  const CHECK_DURATION_MS = 15000;
+  const THROTTLE_MS = 400;
+
+  let currentUrl = null;
+  let urlChangedAt = 0;
+  let dismissedUrl = null;
+  let pendingCheck = null;
+
+  function isItemPage() {
+    return /\/item\/[^/]+/.test(window.location.pathname);
   }
 
-  console.log('[Mercari Warning] Extension loaded on item page');
-  let fallbackCheck2sId = null;
-  let fallbackCheck5sId = null;
-  let checksStopped = false;
-
-  function stopChecks(observer) {
-    if (checksStopped) {
-      return;
-    }
-
-    checksStopped = true;
-    observer.disconnect();
-    clearTimeout(fallbackCheck2sId);
-    clearTimeout(fallbackCheck5sId);
-  }
-
-  function checkItemDelivery() {
-    if (checksStopped) {
-      return false;
-    }
-
-    console.log('[Mercari Warning] Checking item delivery method...');
-    
+  // Returns true/false once the shipping row is found, or null if it hasn't
+  // rendered yet. Only the value next to the label is inspected, so words
+  // in the item description or recommended items can't cause a false alarm.
+  function detectPayOnDelivery() {
     const pageText = document.body.innerText;
-    const pageTextLower = pageText.toLowerCase();
-    console.log('[Mercari Warning] Page text length:', pageText.length);
-    
-    const isPayOnDelivery = pageText.includes('着払い(購入者負担)') ||
-                            pageText.includes('着払い') || 
-                            pageText.includes('代引き') ||
-                            pageText.includes('代金引換') ||
-                            pageTextLower.includes('paid on delivery') ||
-                            pageTextLower.includes('payment on delivery') ||
-                            pageTextLower.includes('pay on delivery') ||
-                            pageTextLower.includes('cash on delivery') ||
-                            pageTextLower.includes('cod') ||
-                            pageText.includes('Paid on delivery');
-    
+    let labelFound = false;
 
-    console.log('[Mercari Warning] isPayOnDelivery:', isPayOnDelivery);
-
-    if (isPayOnDelivery) {
-      console.log('[Mercari Warning] Showing pay-on-delivery warning');
-      showWarning(warningTitle, warningMessage);
-      return true;
-    } else {
-      console.log('[Mercari Warning] No payment method warning needed');
-      return false;
+    for (const label of SHIPPING_LABELS) {
+      let index = pageText.indexOf(label);
+      while (index !== -1) {
+        labelFound = true;
+        const start = index + label.length;
+        // The value is the first non-empty line after the label.
+        const value = (pageText.slice(start).split('\n').map(line => line.trim()).find(Boolean) || '').toLowerCase();
+        if (PAY_ON_DELIVERY_TERMS.some(term => value.includes(term))) {
+          return true;
+        }
+        index = pageText.indexOf(label, start);
+      }
     }
+
+    return labelFound ? false : null;
   }
 
-  function showWarning(title, message) {
-    const existing = document.getElementById('mercari-warning-box');
-    if (existing) {
+  function showWarning() {
+    if (document.getElementById(WARNING_ID)) {
       return;
     }
 
     const warningBox = document.createElement('div');
-    warningBox.id = 'mercari-warning-box';
+    warningBox.id = WARNING_ID;
     warningBox.className = 'mercari-warning';
-    
-    warningBox.innerHTML = `
-      <div class="mercari-warning-header">
-        <span class="mercari-warning-title">${title}</span>
-        <button class="mercari-warning-close" aria-label="${closeWarningAriaLabel}">×</button>
-      </div>
-      <div class="mercari-warning-content">
-        ${message}
-      </div>
-    `;
+    warningBox.setAttribute('role', 'alert');
 
-    document.body.appendChild(warningBox);
+    const header = document.createElement('div');
+    header.className = 'mercari-warning-header';
 
-    const closeBtn = warningBox.querySelector('.mercari-warning-close');
+    const title = document.createElement('span');
+    title.className = 'mercari-warning-title';
+    title.textContent = warningTitle;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'mercari-warning-close';
+    closeBtn.type = 'button';
+    closeBtn.setAttribute('aria-label', closeWarningAriaLabel);
+    closeBtn.textContent = '×';
     closeBtn.addEventListener('click', function() {
-      warningBox.remove();
+      dismissedUrl = currentUrl;
+      removeWarning();
     });
+
+    const content = document.createElement('div');
+    content.className = 'mercari-warning-content';
+    content.textContent = warningMessage;
+
+    header.append(title, closeBtn);
+    warningBox.append(header, content);
+    document.body.appendChild(warningBox);
+  }
+
+  function removeWarning() {
+    const existing = document.getElementById(WARNING_ID);
+    if (existing) {
+      existing.remove();
+    }
+  }
+
+  function check() {
+    pendingCheck = null;
+
+    // Mercari is a single-page app, so the URL changes without a page reload.
+    if (window.location.href !== currentUrl) {
+      log('URL changed:', window.location.href);
+      currentUrl = window.location.href;
+      urlChangedAt = Date.now();
+      removeWarning();
+    }
+
+    if (!isItemPage() || Date.now() - urlChangedAt > CHECK_DURATION_MS) {
+      return;
+    }
+
+    const result = detectPayOnDelivery();
+    log('Pay on delivery:', result);
+
+    if (result === true && dismissedUrl !== currentUrl) {
+      showWarning();
+    } else if (result === false) {
+      removeWarning();
+    }
+  }
+
+  function scheduleCheck() {
+    if (pendingCheck === null) {
+      pendingCheck = setTimeout(check, THROTTLE_MS);
+    }
   }
 
   const observer = new MutationObserver(function() {
-    const pageText = document.body.innerText;
-    if (pageText.includes('Shipping cost') || pageText.includes('配送料の負担')) {
-      console.log('[Mercari Warning] Item details detected, checking delivery method');
-      if (checkItemDelivery()) {
-        stopChecks(observer);
-      } else {
-        observer.disconnect();
-      }
+    if (window.location.href !== currentUrl || Date.now() - urlChangedAt <= CHECK_DURATION_MS) {
+      scheduleCheck();
     }
   });
 
@@ -110,17 +146,6 @@
     characterData: true
   });
 
-  fallbackCheck2sId = setTimeout(function() {
-    console.log('[Mercari Warning] Fallback check (2s)');
-    if (checkItemDelivery()) {
-      stopChecks(observer);
-    }
-  }, 2000);
-
-  fallbackCheck5sId = setTimeout(function() {
-    console.log('[Mercari Warning] Fallback check (5s)');
-    if (checkItemDelivery()) {
-      stopChecks(observer);
-    }
-  }, 5000);
+  window.addEventListener('popstate', scheduleCheck);
+  check();
 })();
